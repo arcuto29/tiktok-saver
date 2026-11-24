@@ -120,7 +120,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="msg" id="msg"></div>
   <div id="result"></div>
 
-  <footer>Version 2 (AI upscale) · Only save posts you made or have permission to use.</footer>
+  <footer>Version 3 (AI upscale, picks fastest GPU) · Only save posts you made or have permission to use.</footer>
 </main>
 
 <script>
@@ -583,6 +583,49 @@ def _ensure_esrgan(job: dict) -> str:
     return exe
 
 
+_gpu_choice: tuple[str, str, int] | None = None  # (index, name, score), detected once per run
+
+
+def _gpu_score(name: str) -> int:
+    """3 = dedicated graphics card, 1-2 = built-in graphics, 0 = software (CPU) renderer."""
+    n = name.lower()
+    if any(k in n for k in ("llvmpipe", "lavapipe", "swiftshader", "microsoft basic")):
+        return 0
+    if any(k in n for k in ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla",
+                            "radeon rx", "radeon pro", "arc(tm) a", "arc a", "arc b", "apple")):
+        return 3
+    if "radeon" in n:  # "AMD Radeon(TM) Graphics" = built into the processor
+        return 2
+    return 1  # Intel UHD / Iris and other built-in graphics
+
+
+def _pick_gpu(exe: str, ff: str, tmp: str) -> tuple[str, str, int]:
+    """Laptops often list the slow built-in GPU as #0. Find every GPU and use the fastest one."""
+    global _gpu_choice
+    if _gpu_choice:
+        return _gpu_choice
+    probe = os.path.join(tmp, "gpu-probe.jpg")
+    subprocess.run([ff, "-v", "error", "-y", "-f", "lavfi", "-i", "color=gray:s=32x32", "-frames:v", "1", probe],
+                   capture_output=True, creationflags=NO_WINDOW)
+    try:
+        out = subprocess.run(
+            [exe, "-i", probe, "-o", probe + ".png", "-n", "realesr-animevideov3", "-s", "2",
+             "-m", os.path.join(ESRGAN_DIR, "models")],
+            cwd=ESRGAN_DIR, capture_output=True, text=True, errors="replace", timeout=120,
+            creationflags=NO_WINDOW,
+        )
+        log = (out.stdout or "") + (out.stderr or "")
+    except (OSError, subprocess.TimeoutExpired):
+        log = ""
+    gpus = dict(re.findall(r"^\[(\d+) (.+?)\]\s+queueC=", log, re.M))
+    if not gpus:
+        return ("0", "your graphics card", 3)  # couldn't tell; let the upscaler use its default
+    idx = max(gpus, key=lambda i: (_gpu_score(gpus[i]), -int(i)))
+    _gpu_choice = (idx, gpus[idx].strip(), _gpu_score(gpus[idx]))
+    app.logger.warning("GPUs found: %s -> using #%s %s", gpus, idx, gpus[idx])
+    return _gpu_choice
+
+
 def _set(job: dict, **kw):
     with _jobs_lock:
         job.update(kw)
@@ -664,7 +707,12 @@ def _run_upscale(job: dict, data: dict, target: int, style: str):
 
         short = min(w, h)
         scale = next((s for s in scales if short * s >= target), scales[-1])
-        _set(job, stage=f"AI upscaling {total} frames on your graphics card", progress=0.10)
+        _set(job, stage="Finding your fastest graphics card", progress=0.10)
+        gpu_idx, gpu_name, gpu_score = _pick_gpu(exe, ff, tmp)
+        where = f"on {gpu_name}"
+        if gpu_score < 3:
+            where += " (no dedicated graphics card found, so this is slow)"
+        _set(job, stage=f"AI upscaling {total} frames {where}")
         log = os.path.join(tmp, "esrgan.log")
         started = time.time()
 
@@ -673,11 +721,11 @@ def _run_upscale(job: dict, data: dict, target: int, style: str):
             elapsed = time.time() - started
             eta = (elapsed / done) * (total - done) if done >= 3 else None
             _set(job, progress=0.10 + 0.80 * done / total, eta=eta,
-                 stage=f"AI upscaling frame {done} of {total} on your graphics card")
+                 stage=f"AI upscaling frame {done} of {total} {where}")
 
         with open(log, "w") as logf:
             rc = _wait(job, subprocess.Popen(
-                [exe, "-i", in_dir, "-o", out_dir, "-n", model, "-s", str(scale), "-f", "jpg",
+                [exe, "-i", in_dir, "-o", out_dir, "-n", model, "-s", str(scale), "-f", "jpg", "-g", gpu_idx,
                  "-m", os.path.join(ESRGAN_DIR, "models")],
                 cwd=ESRGAN_DIR, stdout=logf, stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
             ), on_tick=tick)
