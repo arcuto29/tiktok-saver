@@ -120,7 +120,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="msg" id="msg"></div>
   <div id="result"></div>
 
-  <footer>Only save posts you made or have permission to use.</footer>
+  <footer>Version 2 (AI upscale) · Only save posts you made or have permission to use.</footer>
 </main>
 
 <script>
@@ -801,8 +801,21 @@ def api_upscale_file(job_id):
     return send_file(job["file"], as_attachment=True, download_name=job["name"])
 
 
+def _free_port(start: int) -> int:
+    """Use the first free port from `start`, so an old copy still running doesn't block this one."""
+    import socket
+    for port in range(start, start + 20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    raise SystemExit("No free port found. Close other copies of TikTok Saver and try again.")
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = _free_port(int(os.environ.get("PORT", "5000")))
     print(f"\n  TikTok Saver is running: open http://127.0.0.1:{port} in your browser\n")
     import webbrowser
     threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
