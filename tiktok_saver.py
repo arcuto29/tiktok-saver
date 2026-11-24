@@ -12,11 +12,12 @@ import subprocess
 import sys
 
 try:
-    import flask, yt_dlp  # noqa: F401
+    import flask, yt_dlp, imageio_ffmpeg  # noqa: F401
 except ImportError:
-    print("First run: installing flask and yt-dlp (takes a minute)...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "flask", "yt-dlp"])
+    print("First run: installing flask, yt-dlp and ffmpeg (takes a minute)...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "flask", "yt-dlp", "imageio-ffmpeg"])
 
+import atexit
 import io
 import json
 import os
@@ -87,6 +88,21 @@ INDEX_HTML = r"""<!doctype html>
   .grid span { position: absolute; left: 6px; bottom: 6px; font-size: 12px; background: rgba(0,0,0,.65); padding: 2px 6px; border-radius: 6px; color: #fff; }
   .spin { width: 16px; height: 16px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: s .7s linear infinite; }
   @keyframes s { to { transform: rotate(360deg); } }
+  .up { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .up-title { font-weight: 600; margin-bottom: 4px; }
+  .up-title small { color: var(--muted); font-weight: 400; }
+  .seg { display: inline-flex; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 3px; margin: 8px 0 10px; flex-wrap: wrap; }
+  .seg label { padding: 6px 10px; border-radius: 8px; font-size: 13px; cursor: pointer; color: var(--muted); }
+  .seg input { display: none; }
+  .seg label:has(input:checked) { background: var(--card); color: var(--text); }
+  .targets { display: flex; gap: 8px; flex-wrap: wrap; }
+  .targets button { padding: 10px 16px; background: var(--bg); color: var(--text); border: 1px solid var(--line); }
+  .targets button:hover:not(:disabled) { border-color: var(--accent); }
+  .bar { height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden; margin: 12px 0 6px; }
+  .bar div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent2)); transition: width .4s; }
+  .up-line { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; color: var(--muted); align-items: center; }
+  .linkbtn { background: none; border: 0; color: var(--muted); text-decoration: underline; padding: 0; font-size: 13px; font-weight: 400; }
+  .hint { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
   footer { margin-top: 32px; color: var(--muted); font-size: 13px; }
   @media (max-width: 480px) { form { flex-wrap: wrap; } input { flex-basis: 100%; } .thumb { width: 90px; } }
 </style>
@@ -153,8 +169,64 @@ function showVideo(d) {
     <div class="card"><div class="row">
       ${d.thumbnail ? `<img class="thumb" src="${esc(d.thumbnail)}" referrerpolicy="no-referrer" alt="">` : ""}
       <div class="meta">${header(d)}<div class="choices">${buttons}</div>${note}</div>
-    </div></div>`;
+    </div>${upscalePanel(d)}</div>`;
   result.querySelectorAll("a.choice").forEach((a) => a.addEventListener("click", () => say("Downloading… the file will appear in a moment.")));
+  result.querySelectorAll(".targets button").forEach((b) => b.addEventListener("click", () => startUpscale(d, +b.dataset.t)));
+}
+
+const sizeName = (t) => (t === 2160 ? "4K" : `${t}p`);
+const fmtTime = (s) => (s < 60 ? `${Math.max(1, Math.round(s))} s` : `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`);
+
+function upscalePanel(d) {
+  if (!d.upscale_targets || !d.upscale_targets.length) return "";
+  return `
+    <div class="up">
+      <div class="up-title">✨ AI upscale <small>· sharper, but takes a while</small></div>
+      <div class="seg">
+        <label><input type="radio" name="style" value="fast" checked>Screen recording / text / animation</label>
+        <label><input type="radio" name="style" value="detailed">Real-life camera footage (slower)</label>
+      </div>
+      <div class="targets">${d.upscale_targets.map((t) => `<button type="button" data-t="${t}">Upscale to ${sizeName(t)}</button>`).join("")}</div>
+      <div id="upstatus" hidden>
+        <div class="bar"><div id="upbar"></div></div>
+        <div class="up-line"><span id="upstage"></span><span><span id="upeta"></span> <button type="button" class="linkbtn" id="upcancel">Cancel</button></span></div>
+      </div>
+      <p class="hint">Runs on your own graphics card. The AI sharpens edges and text by predicting detail. It can't bring back detail TikTok threw away.</p>
+    </div>`;
+}
+
+async function startUpscale(d, target) {
+  const style = result.querySelector('input[name="style"]:checked').value;
+  const btns = result.querySelectorAll(".targets button, .seg input");
+  const status = $("upstatus"), bar = $("upbar"), stage = $("upstage"), eta = $("upeta"), cancel = $("upcancel");
+  btns.forEach((b) => (b.disabled = true));
+  status.hidden = false; cancel.hidden = false; bar.style.width = "0"; stage.textContent = "Starting…"; eta.textContent = "";
+  const done = () => { btns.forEach((b) => (b.disabled = false)); cancel.hidden = true; eta.textContent = ""; };
+  try {
+    const r = await fetch("/api/upscale", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: d.token, target, style }) });
+    const { job, error } = await r.json();
+    if (!r.ok) throw new Error(error);
+    cancel.onclick = () => { cancel.hidden = true; stage.textContent = "Cancelling…"; fetch(`/api/upscale/${job}/cancel`, { method: "POST" }); };
+    while (true) {
+      await new Promise((res) => setTimeout(res, 1000));
+      const s = await (await fetch(`/api/upscale/${job}`)).json();
+      if (s.error && !s.done) throw new Error(s.error);
+      bar.style.width = `${Math.round((s.progress || 0) * 100)}%`;
+      stage.textContent = s.stage + (s.done ? "" : "…");
+      eta.textContent = s.eta ? `about ${fmtTime(s.eta)} left ·` : "";
+      if (s.done) {
+        if (s.error) throw new Error(s.error);
+        stage.innerHTML = `Done · <a class="linkbtn" href="/api/upscale/${job}/file">download again</a>`;
+        location.href = `/api/upscale/${job}/file`;
+        say(`Your ${sizeName(target)} video is downloading${mb(s.size)}.`);
+        break;
+      }
+    }
+  } catch (err) {
+    stage.textContent = err.message;
+  } finally {
+    done();
+  }
 }
 
 function showPhotos(d) {
@@ -351,6 +423,8 @@ def api_resolve():
         "kind": "video",
         "url": info.get("webpage_url"),
         "allowed": [c["id"] for c in choices],
+        "best": best["format_id"],
+        "src_res": res(best),
         "name": base_name,
     })
     return jsonify(
@@ -358,6 +432,7 @@ def api_resolve():
         caption=caption or info.get("description") or "",
         thumbnail=info.get("thumbnail"), duration=info.get("duration"),
         width=best.get("width"), height=best.get("height"), choices=choices,
+        upscale_targets=[t for t in UPSCALE_TARGETS if t > res(best)],
     )
 
 
@@ -446,6 +521,284 @@ def api_photos_zip():
         return f"Download failed: {e}", 502
     buf.seek(0)
     return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=data["name"] + ".zip")
+
+
+# ---------- AI upscaling (Real-ESRGAN, runs on your graphics card) ----------
+
+UPSCALE_TARGETS = (1080, 1440, 2160)
+UPSCALE_STYLES = {
+    # name -> (Real-ESRGAN model, supported scales)
+    "fast": ("realesr-animevideov3", (2, 3, 4)),  # screen recordings, text, graphics, anime
+    "detailed": ("realesrgan-x4plus", (4,)),       # real camera footage; several times slower
+}
+TOOLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+ESRGAN_DIR = os.path.join(TOOLS_DIR, "realesrgan")
+ESRGAN_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+    "realesrgan-ncnn-vulkan-20220424-{}.zip"
+)
+JOB_TTL = 60 * 60
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # don't flash console windows on Windows
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
+_upscale_busy = threading.Lock()  # the GPU can only do one video at a time
+
+
+class Cancelled(Exception):
+    pass
+
+
+def _esrgan_exe() -> str:
+    return os.path.join(ESRGAN_DIR, "realesrgan-ncnn-vulkan.exe" if os.name == "nt" else "realesrgan-ncnn-vulkan")
+
+
+def _ensure_esrgan(job: dict) -> str:
+    """Download the portable Real-ESRGAN build on first use (about 50 MB)."""
+    exe = _esrgan_exe()
+    if os.path.exists(exe):
+        return exe
+    plat = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "ubuntu"
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    part_zip = os.path.join(TOOLS_DIR, "realesrgan.zip.part")
+    part_dir = ESRGAN_DIR + ".part"
+    with new_ydl() as ydl, ydl.urlopen(Request(ESRGAN_URL.format(plat))) as resp, open(part_zip, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        got = 0
+        while chunk := resp.read(1 << 20):
+            _check_cancel(job)
+            out.write(chunk)
+            got += len(chunk)
+            _set(job, stage="Downloading the AI upscaler (one time, about 50 MB)",
+                 progress=0.05 * got / total if total else 0)
+    shutil.rmtree(part_dir, ignore_errors=True)
+    with zipfile.ZipFile(part_zip) as z:
+        for m in z.infolist():
+            base = os.path.basename(m.filename)
+            if m.filename.startswith("models/") or base.startswith("realesrgan-ncnn-vulkan") or base.endswith(".dll"):
+                z.extract(m, part_dir)
+    os.chmod(os.path.join(part_dir, os.path.basename(exe)), 0o755)
+    shutil.rmtree(ESRGAN_DIR, ignore_errors=True)
+    os.replace(part_dir, ESRGAN_DIR)
+    os.remove(part_zip)
+    return exe
+
+
+def _set(job: dict, **kw):
+    with _jobs_lock:
+        job.update(kw)
+
+
+def _check_cancel(job: dict):
+    if job.get("cancel"):
+        raise Cancelled()
+
+
+def _count_files(folder: str) -> int:
+    with os.scandir(folder) as it:
+        return sum(1 for _ in it)
+
+
+def _wait(job: dict, proc: subprocess.Popen, on_tick=None):
+    """Wait for a subprocess, reporting progress and honouring Cancel."""
+    with _jobs_lock:
+        job["proc"] = proc
+    try:
+        while proc.poll() is None:
+            if job.get("cancel"):
+                proc.terminate()
+                proc.wait()
+                raise Cancelled()
+            if on_tick:
+                on_tick()
+            time.sleep(0.5)
+    finally:
+        with _jobs_lock:
+            job["proc"] = None
+    return proc.returncode
+
+
+def _tail(path: str, n: int = 6) -> str:
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = [l.strip() for l in f if l.strip() and not l.strip().endswith("%")]
+        return " | ".join(lines[-n:])
+    except OSError:
+        return ""
+
+
+def _run_upscale(job: dict, data: dict, target: int, style: str):
+    import imageio_ffmpeg
+
+    tmp = job["tmp"]
+    model, scales = UPSCALE_STYLES[style]
+    try:
+        exe = _ensure_esrgan(job)
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+
+        _set(job, stage="Downloading the original video", progress=0.05)
+        with new_ydl(format=data["best"], outtmpl=os.path.join(tmp, "src.%(ext)s")) as ydl:
+            ydl.download([data["url"]])
+        src = next(os.path.join(tmp, f) for f in os.listdir(tmp) if f.startswith("src."))
+        _check_cancel(job)
+
+        frames_gen = imageio_ffmpeg.read_frames(src)
+        meta = next(frames_gen)
+        frames_gen.close()
+        w, h = meta["source_size"]
+        fps = meta.get("fps") or 30
+        total = max(1, int(round((meta.get("duration") or 0) * fps)))
+
+        in_dir, out_dir = os.path.join(tmp, "in"), os.path.join(tmp, "out")
+        os.makedirs(in_dir)
+        os.makedirs(out_dir)
+
+        _set(job, stage="Splitting the video into frames", progress=0.07)
+        rc = _wait(job, subprocess.Popen(
+            [ff, "-v", "error", "-i", src, "-vf", f"fps={fps}", "-q:v", "1", "-qmin", "1",
+             os.path.join(in_dir, "%08d.jpg")],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
+        ), on_tick=lambda: _set(job, progress=0.07 + 0.03 * min(1, _count_files(in_dir) / total)))
+        total = _count_files(in_dir)
+        if rc != 0 or total == 0:
+            raise RuntimeError("couldn't read the video frames")
+
+        short = min(w, h)
+        scale = next((s for s in scales if short * s >= target), scales[-1])
+        _set(job, stage=f"AI upscaling {total} frames on your graphics card", progress=0.10)
+        log = os.path.join(tmp, "esrgan.log")
+        started = time.time()
+
+        def tick():
+            done = _count_files(out_dir)
+            elapsed = time.time() - started
+            eta = (elapsed / done) * (total - done) if done >= 3 else None
+            _set(job, progress=0.10 + 0.80 * done / total, eta=eta,
+                 stage=f"AI upscaling frame {done} of {total} on your graphics card")
+
+        with open(log, "w") as logf:
+            rc = _wait(job, subprocess.Popen(
+                [exe, "-i", in_dir, "-o", out_dir, "-n", model, "-s", str(scale), "-f", "jpg",
+                 "-m", os.path.join(ESRGAN_DIR, "models")],
+                cwd=ESRGAN_DIR, stdout=logf, stderr=subprocess.STDOUT, creationflags=NO_WINDOW,
+            ), on_tick=tick)
+        if rc != 0 or _count_files(out_dir) < total:
+            detail = _tail(log)
+            if any(s in detail.lower() for s in ("vkcreateinstance", "invalid gpu", "libvulkan", "vulkan-1.dll")):
+                raise RuntimeError(
+                    "the AI upscaler couldn't find a graphics card it can use. "
+                    "Update your graphics drivers (NVIDIA, AMD or Intel) and try again."
+                )
+            raise RuntimeError(f"the AI upscaler stopped ({detail or 'exit code ' + str(rc)})")
+        shutil.rmtree(in_dir, ignore_errors=True)  # free disk space before encoding
+
+        # Final size: shorter side = target, keep aspect ratio, even numbers for the encoder
+        k = target / short
+        out_w, out_h = int(round(w * k / 2)) * 2, int(round(h * k / 2)) * 2
+        out = os.path.join(tmp, "upscaled.mp4")
+        _set(job, stage="Building the final video", progress=0.90, eta=None)
+        def enc_tick():
+            try:
+                with open(os.path.join(tmp, "enc.txt")) as f:
+                    nums = re.findall(r"^frame=(\d+)", f.read(), re.M)
+                if nums:
+                    _set(job, progress=0.90 + 0.10 * min(1, int(nums[-1]) / total))
+            except OSError:
+                pass
+
+        with open(os.path.join(tmp, "enc.log"), "w") as enc_log:
+            rc = _wait(job, subprocess.Popen(
+                [ff, "-v", "error", "-y", "-framerate", str(fps), "-i", os.path.join(out_dir, "%08d.jpg"),
+                 "-i", src, "-map", "0:v:0", "-map", "1:a:0?",
+                 "-vf", f"scale={out_w}:{out_h}:flags=lanczos:in_range=pc:out_range=tv,format=yuv420p",
+                 "-color_range", "tv",
+                 "-c:v", "libx264", "-preset", "medium", "-crf", "16", "-c:a", "copy",
+                 "-shortest", "-movflags", "+faststart", "-progress", os.path.join(tmp, "enc.txt"), out],
+                stdout=subprocess.DEVNULL, stderr=enc_log, creationflags=NO_WINDOW,
+            ), on_tick=enc_tick)
+        if rc != 0:
+            raise RuntimeError(f"encoding failed ({_tail(os.path.join(tmp, 'enc.log'))})")
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+        label = "4K" if target == 2160 else f"{target}p"
+        _set(job, stage="Done", progress=1.0, done=True, file=out,
+             name=f"{data['name']} {label} AI.mp4", size=os.path.getsize(out))
+    except Cancelled:
+        _set(job, stage="Cancelled", done=True, error="Cancelled.")
+        shutil.rmtree(tmp, ignore_errors=True)
+    except Exception as e:
+        app.logger.exception("upscale failed")
+        _set(job, done=True, error=f"Upscale failed: {e}")
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        _upscale_busy.release()
+
+
+@atexit.register
+def _cleanup_all_jobs():
+    for job in list(_jobs.values()):
+        if job.get("proc"):
+            job["proc"].terminate()
+        shutil.rmtree(job["tmp"], ignore_errors=True)
+
+
+def _cleanup_jobs():
+    now = time.time()
+    with _jobs_lock:
+        old = [k for k, j in _jobs.items() if j["done"] and now - j["t"] > JOB_TTL]
+        for k in old:
+            shutil.rmtree(_jobs.pop(k)["tmp"], ignore_errors=True)
+
+
+@app.post("/api/upscale")
+def api_upscale():
+    body = request.get_json(silent=True) or {}
+    data = cache_get(body.get("token"))
+    if not data or data["kind"] != "video":
+        return jsonify(error="This link expired. Paste it again."), 410
+    try:
+        target = int(body.get("target"))
+    except (TypeError, ValueError):
+        target = 0
+    style = body.get("style") if body.get("style") in UPSCALE_STYLES else "fast"
+    if target not in UPSCALE_TARGETS or target <= data["src_res"]:
+        return jsonify(error="Pick a size bigger than the original."), 400
+    _cleanup_jobs()
+    if not _upscale_busy.acquire(blocking=False):
+        return jsonify(error="Another video is being upscaled. Wait for it to finish or cancel it."), 409
+    job_id = secrets.token_urlsafe(12)
+    job = {"t": time.time(), "tmp": tempfile.mkdtemp(prefix="tiksave-up-"), "stage": "Starting",
+           "progress": 0.0, "eta": None, "done": False, "error": None, "cancel": False, "proc": None}
+    with _jobs_lock:
+        _jobs[job_id] = job
+    threading.Thread(target=_run_upscale, args=(job, data, target, style), daemon=True).start()
+    return jsonify(job=job_id)
+
+
+@app.get("/api/upscale/<job_id>")
+def api_upscale_status(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify(error="Unknown job."), 404
+        return jsonify({k: job.get(k) for k in ("stage", "progress", "eta", "done", "error", "size")})
+
+
+@app.post("/api/upscale/<job_id>/cancel")
+def api_upscale_cancel(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job:
+            job["cancel"] = True
+    return jsonify(ok=bool(job))
+
+
+@app.get("/api/upscale/<job_id>/file")
+def api_upscale_file(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or not job.get("file") or not os.path.exists(job["file"]):
+        return "This file isn't available any more. Upscale again.", 410
+    return send_file(job["file"], as_attachment=True, download_name=job["name"])
 
 
 if __name__ == "__main__":

@@ -18,6 +18,11 @@ The first start takes about a minute to install. The app runs only on your compu
 - **Videos:** TikTok keeps a clean copy of every video next to the watermarked one. The app skips the watermarked file and saves the clean original byte-for-byte. Nothing is re-encoded, so quality is exactly what TikTok has (usually up to 1080p).
   - **Best quality**: highest resolution, usually H.265/HEVC. Plays on phones, Mac, Chrome, Edge and Windows with the HEVC codec.
   - **Plays everywhere**: H.264 version for older players, often a lower resolution.
+- **AI upscale (optional):** for videos below 4K, you can upscale to 1080p, 1440p or 4K with [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN). It runs on your graphics card (NVIDIA, AMD, Intel or Apple). The first time, it downloads the upscaler into a `tools` folder (about 50 MB).
+  - **Screen recording / text / animation** (default): fast, makes text and chart lines very crisp.
+  - **Real-life camera footage:** a heavier model for people and scenery. Several times slower.
+  - Time depends on your graphics card and the video length. A 30-second video can take anywhere from about a minute to 15 minutes or more. The AI predicts detail, so it looks sharper, but it can't bring back detail TikTok didn't keep.
+  - If it says it can't find a graphics card, update your graphics drivers.
 - **Photos / slideshows:** downloads the original full-size images, one at a time or all together as a .zip.
 - Accepts full links, short share links (`vm.tiktok.com/...`, `tiktok.com/t/...`), or a whole pasted share message.
 
